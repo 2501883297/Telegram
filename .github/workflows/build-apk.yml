@@ -1,23 +1,243 @@
-name: Build Telegram APK
+name: Build Telegram Unobfuscated Release
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - hook-release
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build Telegram Standalone
+    name: Telegram Release - Unsigned - No Obfuscation
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source
+      # ==========================================================
+      # 1. Checkout 当前 hook-release 分支
+      # ==========================================================
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          submodules: recursive
-          fetch-depth: 1
+          fetch-depth: 0
+          submodules: false
 
+      # ==========================================================
+      # 2. 直接获取 Telegram 官方最新 master
+      #
+      # 注意：
+      # 我们不是用你 fork 里的旧源码编译，
+      # 而是直接切到官方最新 master。
+      # ==========================================================
+      - name: Checkout latest official Telegram source
+        shell: bash
+        run: |
+          git remote add upstream https://github.com/DrKLO/Telegram.git || true
+          git remote set-url upstream https://github.com/DrKLO/Telegram.git
+
+          git fetch upstream master
+
+          git checkout --detach upstream/master
+
+          echo "======================================"
+          echo "Official Telegram commit:"
+          git log -1 --oneline
+          echo "======================================"
+
+      # ==========================================================
+      # 3. 更新 Telegram 子模块
+      # ==========================================================
+      - name: Update submodules
+        shell: bash
+        run: |
+          git submodule sync --recursive
+
+          git submodule update \
+            --init \
+            --recursive \
+            --depth=1
+
+      # ==========================================================
+      # 4. 读取官方最新版本信息
+      # ==========================================================
+      - name: Read official Telegram version
+        shell: bash
+        run: |
+          VERSION_NAME=$(grep '^APP_VERSION_NAME=' gradle.properties | cut -d= -f2- | tr -d '\r')
+          VERSION_CODE=$(grep '^APP_VERSION_CODE=' gradle.properties | cut -d= -f2- | tr -d '\r')
+          APP_PACKAGE=$(grep '^APP_PACKAGE=' gradle.properties | cut -d= -f2- | tr -d '\r')
+
+          if [ -z "$VERSION_NAME" ] || [ -z "$VERSION_CODE" ]; then
+            echo "ERROR: Telegram version not found"
+            exit 1
+          fi
+
+          if [ "$APP_PACKAGE" != "org.telegram.messenger" ]; then
+            echo "ERROR: Unexpected package name: $APP_PACKAGE"
+            exit 1
+          fi
+
+          # afat flavor 的 abiVersionCode = 9
+          FINAL_VERSION_CODE=$((VERSION_CODE * 10 + 9))
+
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "FINAL_VERSION_CODE=$FINAL_VERSION_CODE" >> "$GITHUB_ENV"
+          echo "APP_PACKAGE=$APP_PACKAGE" >> "$GITHUB_ENV"
+
+          echo "======================================"
+          echo "Package          : $APP_PACKAGE"
+          echo "Version name     : $VERSION_NAME"
+          echo "Base versionCode : $VERSION_CODE"
+          echo "Afat versionCode : $FINAL_VERSION_CODE"
+          echo "======================================"
+
+      # ==========================================================
+      # 5. 临时修改官方 Release 配置
+      #
+      # 保留：
+      #   release
+      #   debuggable false
+      #   jniDebuggable false
+      #   官方包名
+      #   release manifest
+      #
+      # 修改：
+      #   signingConfig = null
+      #   minifyEnabled = false
+      #   shrinkResources = false
+      #
+      # 只修改当前 Actions 临时目录。
+      # 不会 push 到 GitHub。
+      # ==========================================================
+      - name: Disable R8 and signing
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("TMessagesProj_App/build.gradle")
+          text = path.read_text(encoding="utf-8")
+
+
+          def find_named_block(source, keyword, start=0):
+              pos = source.find(keyword, start)
+
+              if pos == -1:
+                  raise RuntimeError(
+                      f"Could not find block: {keyword}"
+                  )
+
+              brace = source.find("{", pos)
+
+              if brace == -1:
+                  raise RuntimeError(
+                      f"Could not find opening brace: {keyword}"
+                  )
+
+              depth = 0
+
+              for i in range(brace, len(source)):
+                  if source[i] == "{":
+                      depth += 1
+
+                  elif source[i] == "}":
+                      depth -= 1
+
+                      if depth == 0:
+                          return pos, i + 1
+
+              raise RuntimeError(
+                  f"Could not find closing brace: {keyword}"
+              )
+
+
+          # 先精确找到 buildTypes {}
+          bt_start, bt_end = find_named_block(
+              text,
+              "buildTypes"
+          )
+
+          build_types = text[bt_start:bt_end]
+
+          # 再在 buildTypes 内找 release {}
+          rel_start_local, rel_end_local = find_named_block(
+              build_types,
+              "release"
+          )
+
+          release_block = build_types[
+              rel_start_local:rel_end_local
+          ]
+
+          expected = [
+              "debuggable false",
+              "jniDebuggable false",
+              "signingConfig signingConfigs.release",
+              "minifyEnabled true",
+              "shrinkResources true",
+          ]
+
+          for item in expected:
+              if item not in release_block:
+                  raise RuntimeError(
+                      f"Official Gradle structure changed. "
+                      f"Expected line not found: {item}"
+                  )
+
+          release_block = release_block.replace(
+              "signingConfig signingConfigs.release",
+              "signingConfig null",
+              1,
+          )
+
+          release_block = release_block.replace(
+              "minifyEnabled true",
+              "minifyEnabled false",
+              1,
+          )
+
+          release_block = release_block.replace(
+              "shrinkResources true",
+              "shrinkResources false",
+              1,
+          )
+
+          new_build_types = (
+              build_types[:rel_start_local]
+              + release_block
+              + build_types[rel_end_local:]
+          )
+
+          new_text = (
+              text[:bt_start]
+              + new_build_types
+              + text[bt_end:]
+          )
+
+          path.write_text(
+              new_text,
+              encoding="utf-8"
+          )
+
+          print("Release patched successfully")
+          print("  signingConfig   = null")
+          print("  minifyEnabled   = false")
+          print("  shrinkResources = false")
+          PY
+
+      # ==========================================================
+      # 6. 显示修改，方便检查
+      # ==========================================================
+      - name: Show Release changes
+        shell: bash
+        run: |
+          git diff -- TMessagesProj_App/build.gradle
+
+      # ==========================================================
+      # 7. Java
+      # ==========================================================
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
@@ -25,12 +245,21 @@ jobs:
           java-version: "17"
           cache: gradle
 
+      # ==========================================================
+      # 8. Android SDK
+      #
+      # 使用 v4，避免之前 setup-android@v3 的
+      # "Failed to find package 'tools'"
+      # ==========================================================
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
           packages: ''
 
-      - name: Install Android build tools
+      # ==========================================================
+      # 9. 安装 Telegram 官方当前需要的组件
+      # ==========================================================
+      - name: Install Android build components
         shell: bash
         run: |
           sdkmanager \
@@ -40,47 +269,132 @@ jobs:
             "ndk;27.2.12479018" \
             "cmake;3.22.1"
 
+      # ==========================================================
+      # 10. Gradle
+      # ==========================================================
       - name: Prepare Gradle
-        run: chmod +x ./gradlew
-
-      - name: Show environment
+        shell: bash
         run: |
+          chmod +x ./gradlew
+
           java -version
-          sdkmanager --version
           ./gradlew --version
 
-      - name: Build obfuscated APK
+      # ==========================================================
+      # 11. 只编译一个：
+      #
+      # afat + release
+      #
+      # 不编译 debug
+      # 不编译 standalone
+      # 不编译 bundle
+      # ==========================================================
+      - name: Build unsigned unobfuscated Release APK
+        shell: bash
         run: |
           ./gradlew \
-            :TMessagesProj_AppStandalone:assembleAfatStandalone \
-            --stacktrace \
-            --no-daemon
+            :TMessagesProj_App:assembleAfatRelease \
+            --no-daemon \
+            --stacktrace
 
-      - name: Show build outputs
-        if: always()
+      # ==========================================================
+      # 12. 找到生成的唯一 APK
+      # ==========================================================
+      - name: Prepare APK
+        shell: bash
         run: |
-          echo "===== APK ====="
-          find TMessagesProj_AppStandalone/build/outputs \
-            -type f -name "*.apk" -print || true
+          mkdir -p dist
 
-          echo "===== Mapping ====="
-          find TMessagesProj_AppStandalone/build/outputs \
-            -type f -name "mapping.txt" -print || true
+          APK_LIST=$(find \
+            TMessagesProj_App/build/outputs/apk/afat/release \
+            -type f \
+            -name "*.apk")
 
+          APK_COUNT=$(echo "$APK_LIST" | sed '/^$/d' | wc -l)
+
+          if [ "$APK_COUNT" -ne 1 ]; then
+            echo "ERROR: Expected exactly one APK."
+            echo "Found: $APK_COUNT"
+
+            echo "$APK_LIST"
+
+            exit 1
+          fi
+
+          APK_FILE=$(echo "$APK_LIST" | head -n 1)
+
+          OUTPUT_NAME="Telegram-${VERSION_NAME}-${FINAL_VERSION_CODE}-Release-Unsigned-NoObfuscation.apk"
+
+          cp "$APK_FILE" "dist/$OUTPUT_NAME"
+
+          echo "APK_PATH=dist/$OUTPUT_NAME" >> "$GITHUB_ENV"
+          echo "APK_NAME=$OUTPUT_NAME" >> "$GITHUB_ENV"
+
+          echo "Generated:"
+          ls -lh "dist/$OUTPUT_NAME"
+
+      # ==========================================================
+      # 13. 验证包名、版本号
+      # ==========================================================
+      - name: Verify APK metadata
+        shell: bash
+        run: |
+          AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt"
+
+          echo "======================================"
+          "$AAPT" dump badging "$APK_PATH" | head -n 1
+          echo "======================================"
+
+          BADGING=$("$AAPT" dump badging "$APK_PATH" | head -n 1)
+
+          echo "$BADGING" | grep "name='org.telegram.messenger'" >/dev/null
+          echo "$BADGING" | grep "versionName='${VERSION_NAME}'" >/dev/null
+          echo "$BADGING" | grep "versionCode='${FINAL_VERSION_CODE}'" >/dev/null
+
+          echo "Package/version verification passed"
+
+      # ==========================================================
+      # 14. 验证确实未签名
+      # ==========================================================
+      - name: Verify APK is unsigned
+        shell: bash
+        run: |
+          APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+
+          if "$APKSIGNER" verify "$APK_PATH" >/dev/null 2>&1; then
+            echo "ERROR: APK unexpectedly contains a valid signature"
+            exit 1
+          fi
+
+          echo "APK is unsigned: OK"
+
+      # ==========================================================
+      # 15. 验证 R8 没运行
+      # ==========================================================
+      - name: Verify R8 is disabled
+        shell: bash
+        run: |
+          MAPPING=$(find \
+            TMessagesProj_App/build/outputs \
+            -type f \
+            -name "mapping.txt" \
+            2>/dev/null || true)
+
+          if [ -n "$MAPPING" ]; then
+            echo "ERROR: R8 mapping.txt was generated"
+            echo "$MAPPING"
+            exit 1
+          fi
+
+          echo "No R8 mapping.txt: OK"
+
+      # ==========================================================
+      # 16. 只上传这一个 APK
+      # ==========================================================
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Telegram-Standalone-APK
-          path: |
-            TMessagesProj_AppStandalone/build/outputs/apk/**/*.apk
+          name: Telegram-${{ env.VERSION_NAME }}-Release-Unsigned-NoObfuscation
+          path: ${{ env.APK_PATH }}
           if-no-files-found: error
           retention-days: 14
-
-      - name: Upload R8 mapping
-        uses: actions/upload-artifact@v4
-        with:
-          name: Telegram-R8-Mapping
-          path: |
-            TMessagesProj_AppStandalone/build/outputs/**/mapping.txt
-          if-no-files-found: warn
-          retention-days: 30
