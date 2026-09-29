@@ -1,0 +1,89 @@
+name: Build Telegram APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Telegram Standalone
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 下载源码，同时拉取 Telegram 的子模块
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      # 2. 安装 Java
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      # 3. 安装 Android SDK
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # 4. 安装 Telegram 构建需要的组件
+      - name: Install Android build tools
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1"
+
+      # 5. 给 gradlew 执行权限
+      - name: Prepare Gradle
+        run: chmod +x ./gradlew
+
+      # 6. 编译带 R8 混淆的 Standalone APK
+      - name: Build obfuscated APK
+        run: |
+          ./gradlew \
+            :TMessagesProj_AppStandalone:assembleAfatStandalone \
+            --stacktrace \
+            --no-daemon
+
+      # 7. 看一下实际生成了什么文件
+      - name: Show build outputs
+        if: always()
+        run: |
+          echo "===== APK ====="
+          find TMessagesProj_AppStandalone/build/outputs \
+            -type f -name "*.apk" -print || true
+
+          echo "===== Mapping ====="
+          find TMessagesProj_AppStandalone/build/outputs \
+            -type f -name "mapping.txt" -print || true
+
+      # 8. 上传 APK 到 GitHub Actions
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-Standalone-APK
+          path: |
+            TMessagesProj_AppStandalone/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      # 9. 保存 R8 混淆映射文件
+      - name: Upload R8 mapping
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-R8-Mapping
+          path: |
+            TMessagesProj_AppStandalone/build/outputs/**/mapping.txt
+          if-no-files-found: warn
+          retention-days: 30
